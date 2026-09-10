@@ -10,6 +10,8 @@ from metric import valid
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--run_dir', required=True)
+    parser.add_argument('--feature_mode', choices=['common', 'concat', 'both'], default='common',
+                        help='KMeans input: commonz, [commonz, *hs], or evaluate both')
     args = parser.parse_args()
     folder = Path(args.run_dir)
     config = json.loads((folder / 'config.json').read_text())
@@ -17,4 +19,16 @@ if __name__ == '__main__':
     dataset, dims, views, size, classes = load_data(config['dataset'])
     model = TMCN(views, dims, config['low_feature_dim'], config['high_feature_dim'], device).to(device)
     model.load_state_dict(torch.load(folder / 'model.pth', map_location=device, weights_only=True))
-    valid(model, device, dataset, views, size, classes, seed=config['seed'])
+    modes = ['common', 'concat'] if args.feature_mode == 'both' else [args.feature_mode]
+    results = {}
+    for mode in modes:
+        metrics = valid(model, device, dataset, views, size, classes,
+                        seed=config['seed'], feature_mode=mode)
+        results[mode] = metrics
+        report = dict(feature_mode=mode, seed=config['seed'], n_init=100,
+                      feature_dim=config['high_feature_dim'] * (views + 1 if mode == 'concat' else 1),
+                      metrics=metrics)
+        (folder / ('eval_' + mode + '.json')).write_text(json.dumps(report, indent=2))
+    if len(results) == 2:
+        print('concat - common:', {k: results['concat'][k] - results['common'][k]
+                                  for k in results['common']})

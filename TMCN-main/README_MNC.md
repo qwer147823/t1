@@ -43,3 +43,29 @@ KMeans 使用固定 seed，n_init=100。只评估最终模型，不根据真实�
 测试覆盖链式图的精确跳数、互近邻与梯度隔离、空邻居/单样本、解析损失值、
 小 batch、权重调度以及原始 TMCN + AsCL + MNC 在 CPU 上的合成数据反向传播。
 未执行 Hdigit 训练，未验证 GPU 运行或精度增益。
+
+## 无需重训：拼接各视图投影表示再聚类
+
+```bash
+# 在同一个已有 checkpoint 上比较两种聚类特征
+python test.py --run_dir runs/baseline_s10 --feature_mode both
+python test.py --run_dir runs/mnc1_s10 --feature_mode both
+# 或只计算拼接版
+python test.py --run_dir runs/mnc1_s10 --feature_mode concat
+```
+
+默认 common 使用 commonz；concat 使用 torch.cat([commonz, *hs], dim=1)。
+Hdigit 默认由 128 维变成 384 维，支持任意视图数。使用网络本身已归一化的各块，
+不额外缩放、不引入权重或后处理，不使用标签选择特征。
+每块直接拼接意味着平方欧氏距离为各块距离平方之和：两个视图块合计可能比单个融合块影响更大。
+hs 是共享投影层作用于各视图编码的结果，不等于经过 GMAE 解耦的特异因素。
+
+只影响推理/KMeans，不改变训练、AsCL、MNC 构图或 checkpoint 参数格式。
+已有模型可以直接复用。训练结束默认仍保存 common 的 metrics.json。
+评估分别写 eval_common.json、eval_concat.json；同模式重跑更新对应文件，不覆盖训练指标。
+both 使用相同 checkpoint、样本顺序、KMeans seed 和 n_init=100，并打印指标差值。
+不同特征空间的初始中心不保证相同，固定 seed 只是使各模式可复现。
+
+建议比较四组：基线/common、基线/concat、MNC/common、MNC/concat。
+只有对比 MNC/concat 与基线/concat，才能判断拼接条件下 MNC 的增益。
+不保证此前的拼接增益与 MNC 增益可直接相加；不要用测试标签反复挑选特征方案后仍视为无偏评估。
