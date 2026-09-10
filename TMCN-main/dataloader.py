@@ -1,3 +1,4 @@
+from pathlib import Path
 import numpy as np
 from torch.utils.data import Dataset
 import scipy.io
@@ -18,7 +19,9 @@ class Hdigit():
 
 def load_data(dataset):
     if dataset == "Hdigit":
-        dataset = Hdigit('./data/')
+        root = Path(__file__).resolve().parent
+        folder = root / 'data' if (root / 'data' / 'Hdigit.mat').exists() else root
+        dataset = Hdigit(str(folder) + '/')
         dims = [784, 256]
         view = 2
         data_size = 10000
@@ -26,3 +29,4 @@ def load_data(dataset):
     else:
         raise NotImplementedError
     return dataset, dims, view, data_size, class_num
+

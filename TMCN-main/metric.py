@@ -55,7 +55,7 @@ def inference(loader, model, device, view, data_size):
     commonZ = np.array(commonZ)
     return labels_vector, commonZ
 
-def valid(model, device, dataset, view, data_size, class_num):
+def valid(model, device, dataset, view, data_size, class_num, seed=10):
     test_loader = DataLoader(
             dataset,
             batch_size=256,
@@ -64,7 +64,10 @@ def valid(model, device, dataset, view, data_size, class_num):
     labels_vector, commonZ = inference(test_loader, model, device, view, data_size)
     print('---------train over---------')
     print('Clustering results:')
-    kmeans = KMeans(n_clusters=class_num, n_init=100)
+    kmeans = KMeans(n_clusters=class_num, n_init=100, random_state=seed)
     y_pred = kmeans.fit_predict(commonZ)
     nmi, ari, acc, pur = evaluate(labels_vector, y_pred)
     print('ACC = {:.4f} NMI = {:.4f} PUR={:.4f} ARI = {:.4f}'.format(acc, nmi, pur, ari))
+
+
+    return dict(ACC=float(acc), NMI=float(nmi), PUR=float(pur), ARI=float(ari))

@@ -320,7 +320,7 @@ class TMCN(nn.Module):
     
     
     def TMCNF(self, xs):
-        S = torch.zeros([xs[0].size(0),xs[0].size(0)], dtype=torch.float).cuda()
+        S = torch.zeros([xs[0].size(0),xs[0].size(0)], dtype=xs[0].dtype, device=xs[0].device)
         ze = []
         for v in range(self.view):
             x = xs[v]
@@ -335,3 +335,4 @@ class TMCN(nn.Module):
         commone = self.return_to_vector(commone)
         commonz = normalize(self.Common_view(commone), dim=1)
         return commonz, S/self.view
+
