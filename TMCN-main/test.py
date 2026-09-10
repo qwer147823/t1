@@ -1,41 +1,34 @@
-import torch
-from network import GCFAggMVC
-from metric import valid
+"""Evaluate a run using its saved architecture and seed."""
 import argparse
+import json
+from pathlib import Path
+import torch
+from network import TMCN
 from dataloader import load_data
-# Synthetic3d
-# Prokaryotic
-# CCV
-# MNIST-USPS
-# Hdigit
-# YouTubeFace
-# Cifar10
-# Cifar10
-# Caltech-2V
-# Caltech-3V
-# Caltech-4V
-# Caltech-5V
-Dataname = 'Hdigit'
-parser = argparse.ArgumentParser(description='test')
-parser.add_argument('--dataset', default=Dataname)
-parser.add_argument('--batch_size', default=256, type=int)
-parser.add_argument("--temperature_f", default=0.5)
-parser.add_argument("--learning_rate", default=0.0003)
-parser.add_argument("--weight_decay", default=0.)
-parser.add_argument("--workers", default=8)
-parser.add_argument("--rec_epochs", default=200)
-parser.add_argument("--fine_tune_epochs", default=100)
-parser.add_argument("--low_feature_dim", default=512)
-parser.add_argument("--high_feature_dim", default=128)
-args = parser.parse_args()
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from metric import valid
 
-dataset, dims, view, data_size, class_num = load_data(args.dataset)
-model = GCFAggMVC(view, dims, args.low_feature_dim, args.high_feature_dim, device)
-model = model.to(device)
-checkpoint = torch.load('./models/' + args.dataset + '.pth')
-model.load_state_dict(checkpoint)
-print("Dataset:{}".format(args.dataset))
-print("Datasize:" + str(data_size))
-print("Loading models...")
-valid(model, device, dataset, view, data_size, class_num)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--run_dir', required=True)
+    parser.add_argument('--feature_mode', choices=['common', 'concat', 'both'], default='common',
+                        help='KMeans input: commonz, [commonz, *hs], or evaluate both')
+    args = parser.parse_args()
+    folder = Path(args.run_dir)
+    config = json.loads((folder / 'config.json').read_text())
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dataset, dims, views, size, classes = load_data(config['dataset'])
+    model = TMCN(views, dims, config['low_feature_dim'], config['high_feature_dim'], device).to(device)
+    model.load_state_dict(torch.load(folder / 'model.pth', map_location=device, weights_only=True))
+    modes = ['common', 'concat'] if args.feature_mode == 'both' else [args.feature_mode]
+    results = {}
+    for mode in modes:
+        metrics = valid(model, device, dataset, views, size, classes,
+                        seed=config['seed'], feature_mode=mode)
+        results[mode] = metrics
+        report = dict(feature_mode=mode, seed=config['seed'], n_init=100,
+                      feature_dim=config['high_feature_dim'] * (views + 1 if mode == 'concat' else 1),
+                      metrics=metrics)
+        (folder / ('eval_' + mode + '.json')).write_text(json.dumps(report, indent=2))
+    if len(results) == 2:
+        print('concat - common:', {k: results['concat'][k] - results['common'][k]
+                                  for k in results['common']})

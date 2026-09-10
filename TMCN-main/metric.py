@@ -39,7 +39,9 @@ def evaluate(label, pred):
     pur = purity(label, pred)
     return nmi, ari, acc, pur
 
-def inference(loader, model, device, view, data_size):
+def inference(loader, model, device, view, data_size, feature_mode='common'):
+    if feature_mode not in ('common', 'concat'):
+        raise ValueError('feature_mode must be common or concat')
     model.eval()
     commonZ = []
     labels_vector = []
@@ -48,6 +50,11 @@ def inference(loader, model, device, view, data_size):
             xs[v] = xs[v].to(device)
         with torch.no_grad():
             commonz, _ = model.TMCNF(xs)
+            if feature_mode == 'concat':
+                # Use exactly the projected hs from TMCN, in view order.
+                # These are not guaranteed to be disentangled specific factors.
+                _, _, hs = model(xs)
+                commonz = torch.cat([commonz, *hs], dim=1)
             commonz = commonz.detach()
             commonZ.extend(commonz.cpu().detach().numpy())
         labels_vector.extend(y.numpy())
@@ -55,16 +62,20 @@ def inference(loader, model, device, view, data_size):
     commonZ = np.array(commonZ)
     return labels_vector, commonZ
 
-def valid(model, device, dataset, view, data_size, class_num):
+def valid(model, device, dataset, view, data_size, class_num, seed=10,
+          feature_mode='common'):
     test_loader = DataLoader(
             dataset,
             batch_size=256,
             shuffle=False,
         )
-    labels_vector, commonZ = inference(test_loader, model, device, view, data_size)
+    labels_vector, commonZ = inference(test_loader, model, device, view, data_size, feature_mode)
     print('---------train over---------')
-    print('Clustering results:')
-    kmeans = KMeans(n_clusters=class_num, n_init=100)
+    print('Clustering results: mode={}, dimensions={}'.format(feature_mode, commonZ.shape[1]))
+    kmeans = KMeans(n_clusters=class_num, n_init=100, random_state=seed)
     y_pred = kmeans.fit_predict(commonZ)
     nmi, ari, acc, pur = evaluate(labels_vector, y_pred)
     print('ACC = {:.4f} NMI = {:.4f} PUR={:.4f} ARI = {:.4f}'.format(acc, nmi, pur, ari))
+
+
+    return dict(ACC=float(acc), NMI=float(nmi), PUR=float(pur), ARI=float(ari))
