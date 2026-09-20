@@ -277,7 +277,8 @@ class Decoder(nn.Module):
         return self.decoder(x)
 
 class TMCN(nn.Module):
-    def __init__(self, view, input_size, low_feature_dim, high_feature_dim, device):
+    def __init__(self, view, input_size, low_feature_dim, high_feature_dim, device,
+                 complementary=False):
         super(TMCN, self).__init__()
         self.encoders = []
         self.decoders = []
@@ -302,6 +303,30 @@ class TMCN(nn.Module):
         self.MambaEncoder = ResidualBlock(d_model=8, bias= False, conv_bias = True, d_conv=4, d_state =16)
         # self.TransformerEncoderLayer = nn.TransformerEncoderLayer(d_model=low_feature_dim*view, nhead=1, dim_feedforward=256)
         # self.TransformerEncoder = nn.TransformerEncoder(self.TransformerEncoderLayer, num_layers=1)
+        self.complementary = complementary
+        if complementary:
+            # Preserve the original model initialization and RNG stream for ablations.
+            # New layers are created on CPU, then moved with model.to(device).
+            with torch.random.fork_rng(devices=[]):
+                self.complement_heads = nn.ModuleList([
+                    nn.Linear(low_feature_dim, high_feature_dim) for _ in range(view)
+                ])
+                self.joint_decoders = nn.ModuleList([
+                    Decoder(input_size[v], 2 * high_feature_dim) for v in range(view)
+                ])
+
+    def complementary_features(self, zs):
+        if not self.complementary:
+            raise ValueError('Complementary features require --complementary training')
+        return [normalize(head(z), dim=1)
+                for head, z in zip(self.complement_heads, zs)]
+
+    def joint_reconstruct(self, common, specifics):
+        if not self.complementary:
+            raise ValueError('Joint reconstruction requires --complementary training')
+        return [decoder(torch.cat([common, specific], dim=1))
+                for decoder, specific in zip(self.joint_decoders, specifics)]
+
     def forward(self, xs):
         xrs = []
         zs = []
@@ -335,4 +360,5 @@ class TMCN(nn.Module):
         commone = self.return_to_vector(commone)
         commonz = normalize(self.Common_view(commone), dim=1)
         return commonz, S/self.view
+
 

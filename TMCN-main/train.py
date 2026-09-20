@@ -1,5 +1,7 @@
 import torch
 from network import TMCN
+from complementary import decorrelation_loss, branch_diagnostics
+import math
 from metric import valid
 import numpy as np
 import argparse
@@ -29,7 +31,29 @@ parser.add_argument('--mnc_topk', type=int, default=10)
 parser.add_argument('--mnc_min_sim', type=float, default=0.5)
 parser.add_argument('--mnc_start', type=int, default=10)
 parser.add_argument('--mnc_ramp', type=int, default=20)
+parser.add_argument('--complementary', action='store_true',
+                    help='Enable independent complementary heads and joint decoders')
+parser.add_argument('--lambda_joint', type=float, default=1.0)
+parser.add_argument('--lambda_dec', type=float, default=0.0,
+                    help='Maximum weight on mean squared cross-covariance (experimental)')
+parser.add_argument('--dec_start', type=int, default=20)
+parser.add_argument('--dec_ramp', type=int, default=20)
+parser.add_argument('--old_rec_weight', type=float, default=1.0,
+                    help='Original reconstruction weight during fine-tuning only')
 args = parser.parse_args()
+for name in ('lambda_joint', 'lambda_dec', 'old_rec_weight', 'lambda_mnc',
+             'temperature_f', 'learning_rate', 'weight_decay'):
+    value = getattr(args, name)
+    if not math.isfinite(value) or value < 0:
+        parser.error(name + ' must be finite and nonnegative')
+if args.learning_rate == 0 or args.low_feature_dim < 1 or args.high_feature_dim < 1:
+    parser.error('Learning rate and feature dimensions must be positive')
+if args.dec_start < 0 or args.dec_ramp < 0:
+    parser.error('Decorrelation schedule must be nonnegative')
+if args.complementary and args.lambda_joint <= 0:
+    parser.error('--complementary requires a positive --lambda_joint')
+if not args.complementary and (args.lambda_dec != 0 or args.old_rec_weight != 1 or args.lambda_joint != 1):
+    parser.error('Complementary loss options require --complementary')
 if args.lambda_mnc < 0 or args.mnc_topk < 1 or args.mnc_start < 0 or args.mnc_ramp < 0:
     parser.error('Invalid MNC weight, topk, or schedule')
 if not -1 <= args.mnc_min_sim <= 1 or args.temperature_f <= 0:
@@ -89,19 +113,36 @@ def fine_tune(epoch):
     tot_loss = 0.
     total_mnc = 0.
     total_neighbors = 0.
+    components = dict(rec_old=0., ascl=0., rec_joint=0., dec_raw=0.)
+    diagnostics = {}
+    dec_weight = mnc_weight(epoch - args.rec_epochs, args.lambda_dec, args.dec_start, args.dec_ramp)
     weight = mnc_weight(epoch - args.rec_epochs, args.lambda_mnc, args.mnc_start, args.mnc_ramp)
     mes = torch.nn.MSELoss()
     for batch_idx, (xs, _, _) in enumerate(data_loader):
         for v in range(view):
             xs[v] = xs[v].to(device)
         optimizer.zero_grad()
-        xrs, _, hs = model(xs)
+        xrs, zs, hs = model(xs)
         commonz, S = model.TMCNF(xs)
-        loss_list = []
-        for v in range(view):
-            loss_list.append(criterion.Structure_guided_Contrastive_Loss(hs[v], commonz, S))
-            loss_list.append(mes(xs[v], xrs[v]))
-        loss = sum(loss_list)
+        # AsCL remains on the original hs; MNC remains on commonz.
+        rec_terms = [mes(x, xr) for x, xr in zip(xs, xrs)]
+        align_terms = [criterion.Structure_guided_Contrastive_Loss(h, commonz, S) for h in hs]
+        rec_old, ascl = sum(rec_terms), sum(align_terms)
+        # Preserve original interleaved summation order for the disabled baseline.
+        loss = sum(term for pair in zip(align_terms, rec_terms)
+                   for term in (pair[0], args.old_rec_weight * pair[1]))
+        components['rec_old'] += rec_old.item()
+        components['ascl'] += ascl.item()
+        if args.complementary:
+            specs = model.complementary_features(zs)
+            joint = model.joint_reconstruct(commonz, specs)
+            rec_joint = sum(mes(x, xr) for x, xr in zip(xs, joint))
+            dec = sum(decorrelation_loss(commonz, spec) for spec in specs)
+            loss = loss + args.lambda_joint * rec_joint + dec_weight * dec
+            components['rec_joint'] += rec_joint.item()
+            components['dec_raw'] += dec.item()
+            if batch_idx == 0:
+                diagnostics = branch_diagnostics(model, xs, commonz, specs, joint)
         if weight > 0:
             W = neighbor_weights(commonz, args.mnc_topk, args.mnc_hops, args.mnc_min_sim)
             loss_mnc = neighbor_contrastive_loss(commonz, W, args.temperature_f)
@@ -113,11 +154,16 @@ def fine_tune(epoch):
         tot_loss += loss.item()
     stats = dict(epoch=epoch, loss=tot_loss/len(data_loader), mnc=total_mnc/len(data_loader),
                  mnc_weight=weight, neighbors=total_neighbors/len(data_loader))
+    stats.update({k: v / len(data_loader) for k, v in components.items()})
+    stats.update(diagnostics)
+    stats.update(dec_weight=dec_weight, dec_weighted=dec_weight * stats['dec_raw'],
+                 joint_weighted=args.lambda_joint * stats['rec_joint'])
     print(stats)
     with (run_dir / 'training.jsonl').open('a') as f:
         f.write(json.dumps(stats) + '\n')
 
-model = TMCN(view, dims, args.low_feature_dim, args.high_feature_dim, device)
+model = TMCN(view, dims, args.low_feature_dim, args.high_feature_dim, device,
+             complementary=args.complementary)
 print(model)
 model = model.to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -129,11 +175,11 @@ while epoch <= args.rec_epochs:
 while epoch <= args.rec_epochs + args.fine_tune_epochs:
     fine_tune(epoch)
     if epoch == args.rec_epochs + args.fine_tune_epochs:
+        torch.save(model.state_dict(), run_dir / 'model.pth')
         metrics = valid(model, device, dataset, view, data_size, class_num, seed=args.seed)
         (run_dir / 'metrics.json').write_text(json.dumps(metrics, indent=2))
-        state = model.state_dict()
-        torch.save(state, run_dir / 'model.pth')
         print('Saving model...')
     epoch += 1
+
 
 
