@@ -40,8 +40,10 @@ def evaluate(label, pred):
     return nmi, ari, acc, pur
 
 def inference(loader, model, device, view, data_size, feature_mode='common'):
-    if feature_mode not in ('common', 'concat'):
-        raise ValueError('feature_mode must be common or concat')
+    if feature_mode not in ('common', 'concat', 'complement'):
+        raise ValueError('feature_mode must be common, concat, or complement')
+    if feature_mode == 'complement' and not getattr(model, 'complementary', False):
+        raise ValueError('complement mode requires a checkpoint trained with --complementary')
     model.eval()
     commonZ = []
     labels_vector = []
@@ -55,6 +57,10 @@ def inference(loader, model, device, view, data_size, feature_mode='common'):
                 # These are not guaranteed to be disentangled specific factors.
                 _, _, hs = model(xs)
                 commonz = torch.cat([commonz, *hs], dim=1)
+            elif feature_mode == 'complement':
+                _, zs, _ = model(xs)
+                specs = model.complementary_features(zs)
+                commonz = torch.cat([commonz, *specs], dim=1)
             commonz = commonz.detach()
             commonZ.extend(commonz.cpu().detach().numpy())
         labels_vector.extend(y.numpy())
@@ -79,3 +85,4 @@ def valid(model, device, dataset, view, data_size, class_num, seed=10,
 
 
     return dict(ACC=float(acc), NMI=float(nmi), PUR=float(pur), ARI=float(ari))
+
