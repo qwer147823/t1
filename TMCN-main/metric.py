@@ -4,6 +4,7 @@ from scipy.optimize import linear_sum_assignment
 from torch.utils.data import DataLoader
 import numpy as np
 import torch
+from features import fusion_features, validate_alpha
 
 def cluster_acc(y_true, y_pred):
     y_true = y_true.astype(np.int64)
@@ -39,9 +40,13 @@ def evaluate(label, pred):
     pur = purity(label, pred)
     return nmi, ari, acc, pur
 
-def inference(loader, model, device, view, data_size, feature_mode='common'):
-    if feature_mode not in ('common', 'concat', 'complement'):
-        raise ValueError('feature_mode must be common, concat, or complement')
+def inference(loader, model, device, view, data_size, feature_mode='common', fusion_alpha=None):
+    if feature_mode not in ('common', 'concat', 'weighted_concat', 'complement'):
+        raise ValueError('feature_mode must be common, concat, weighted_concat, or complement')
+    if fusion_alpha is not None:
+        validate_alpha(fusion_alpha)
+        if feature_mode != 'weighted_concat':
+            raise ValueError('fusion_alpha applies only to weighted_concat')
     if feature_mode == 'complement' and not getattr(model, 'complementary', False):
         raise ValueError('complement mode requires a checkpoint trained with --complementary')
     model.eval()
@@ -52,11 +57,11 @@ def inference(loader, model, device, view, data_size, feature_mode='common'):
             xs[v] = xs[v].to(device)
         with torch.no_grad():
             commonz, _ = model.TMCNF(xs)
-            if feature_mode == 'concat':
+            if feature_mode in ('concat', 'weighted_concat'):
                 # Use exactly the projected hs from TMCN, in view order.
                 # These are not guaranteed to be disentangled specific factors.
                 _, _, hs = model(xs)
-                commonz = torch.cat([commonz, *hs], dim=1)
+                commonz = fusion_features(commonz, hs, feature_mode, fusion_alpha)
             elif feature_mode == 'complement':
                 _, zs, _ = model(xs)
                 specs = model.complementary_features(zs)
@@ -69,15 +74,17 @@ def inference(loader, model, device, view, data_size, feature_mode='common'):
     return labels_vector, commonZ
 
 def valid(model, device, dataset, view, data_size, class_num, seed=10,
-          feature_mode='common'):
+          feature_mode='common', fusion_alpha=None):
     test_loader = DataLoader(
             dataset,
             batch_size=256,
             shuffle=False,
         )
-    labels_vector, commonZ = inference(test_loader, model, device, view, data_size, feature_mode)
+    labels_vector, commonZ = inference(test_loader, model, device, view, data_size, feature_mode, fusion_alpha)
     print('---------train over---------')
     print('Clustering results: mode={}, dimensions={}'.format(feature_mode, commonZ.shape[1]))
+    if feature_mode == 'weighted_concat':
+        print('Shared distance weight alpha={}'.format(1.0 / (view + 1) if fusion_alpha is None else fusion_alpha))
     kmeans = KMeans(n_clusters=class_num, n_init=100, random_state=seed)
     y_pred = kmeans.fit_predict(commonZ)
     nmi, ari, acc, pur = evaluate(labels_vector, y_pred)
@@ -85,4 +92,3 @@ def valid(model, device, dataset, view, data_size, class_num, seed=10,
 
 
     return dict(ACC=float(acc), NMI=float(nmi), PUR=float(pur), ARI=float(ari))
-

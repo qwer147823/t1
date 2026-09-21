@@ -23,9 +23,17 @@ def pure_hops(adjacency, hops):
 
 
 @torch.no_grad()
-def neighbor_weights(z, topk=10, hops=1, min_sim=0.5):
+def neighbor_weights(z, topk=10, hops=1, min_sim=0.5, *,
+                     endpoint_min_sim=None, return_stats=False):
+    """Optional endpoint check filters only 2/3-hop candidates, after pure hops.
+
+    A rejected pair is not reassigned to a longer hop. The original graph and
+    one-hop pairs stay unchanged. All construction/diagnostics are detached.
+    """
     if topk < 1 or not -1 <= min_sim <= 1:
         raise ValueError('topk >= 1 and min_sim in [-1, 1] required')
+    if endpoint_min_sim is not None and not -1 <= endpoint_min_sim <= 1:
+        raise ValueError('endpoint_min_sim must be finite and in [-1, 1]')
     n = len(z)
     sim = F.normalize(z.detach(), dim=1) @ F.normalize(z.detach(), dim=1).T
     sim.fill_diagonal_(-float('inf'))
@@ -36,8 +44,18 @@ def neighbor_weights(z, topk=10, hops=1, min_sim=0.5):
     adjacency = adjacency & adjacency.T  # mutual neighbors only
     shells = pure_hops(adjacency, hops)
     weights = torch.zeros_like(sim)
+    stats = {}
     for distance, shell in enumerate(shells):
+        if return_stats:
+            stats['neighbors_candidate_hop' + str(distance + 1)] = shell.float().sum(1).mean().item() if n else 0.
+        if distance > 0 and endpoint_min_sim is not None:
+            shell = shell & (sim >= endpoint_min_sim)
         weights += shell.to(sim.dtype) * (0.5 ** distance)
+        if return_stats:
+            stats['neighbors_kept_hop' + str(distance + 1)] = shell.float().sum(1).mean().item() if n else 0.
+    if return_stats:
+        stats['mnc_active_anchor_fraction'] = (weights.sum(1) > 0).float().mean().item() if n else 0.
+        return weights, stats
     return weights
 
 
