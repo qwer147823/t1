@@ -8,6 +8,7 @@ import argparse
 import random
 from loss import Loss
 from mnc import neighbor_weights, neighbor_contrastive_loss, mnc_weight
+from features import fusion_features, validate_alpha
 import json
 from pathlib import Path
 from dataloader import load_data
@@ -31,6 +32,12 @@ parser.add_argument('--mnc_topk', type=int, default=10)
 parser.add_argument('--mnc_min_sim', type=float, default=0.5)
 parser.add_argument('--mnc_start', type=int, default=10)
 parser.add_argument('--mnc_ramp', type=int, default=20)
+parser.add_argument('--mnc_endpoint_min_sim', type=float, default=None,
+                    help='Optional cosine threshold on endpoints of pure 2/3-hop neighbors')
+parser.add_argument('--mnc_feature_mode', choices=['common', 'concat', 'weighted_concat'], default='common',
+                    help='MNC loss space; the detached graph is always built on commonz')
+parser.add_argument('--fusion_alpha', type=float, default=None,
+                    help='Shared distance weight for weighted_concat MNC; default equal block weights')
 parser.add_argument('--complementary', action='store_true',
                     help='Enable independent complementary heads and joint decoders')
 parser.add_argument('--lambda_joint', type=float, default=1.0)
@@ -41,6 +48,20 @@ parser.add_argument('--dec_ramp', type=int, default=20)
 parser.add_argument('--old_rec_weight', type=float, default=1.0,
                     help='Original reconstruction weight during fine-tuning only')
 args = parser.parse_args()
+if args.fusion_alpha is not None:
+    try:
+        validate_alpha(args.fusion_alpha)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.mnc_feature_mode != 'weighted_concat':
+        parser.error('--fusion_alpha requires --mnc_feature_mode weighted_concat')
+if args.mnc_endpoint_min_sim is not None:
+    if not -1 <= args.mnc_endpoint_min_sim <= 1:
+        parser.error('--mnc_endpoint_min_sim must be finite and in [-1, 1]')
+    if args.mnc_hops == 1:
+        parser.error('--mnc_endpoint_min_sim requires --mnc_hops 2 or 3')
+if args.lambda_mnc == 0 and (args.mnc_endpoint_min_sim is not None or args.mnc_feature_mode != 'common'):
+    parser.error('MNC experiments require --lambda_mnc > 0')
 for name in ('lambda_joint', 'lambda_dec', 'old_rec_weight', 'lambda_mnc',
              'temperature_f', 'learning_rate', 'weight_decay'):
     value = getattr(args, name)
@@ -115,6 +136,7 @@ def fine_tune(epoch):
     total_neighbors = 0.
     components = dict(rec_old=0., ascl=0., rec_joint=0., dec_raw=0.)
     diagnostics = {}
+    graph_stats = {}
     dec_weight = mnc_weight(epoch - args.rec_epochs, args.lambda_dec, args.dec_start, args.dec_ramp)
     weight = mnc_weight(epoch - args.rec_epochs, args.lambda_mnc, args.mnc_start, args.mnc_ramp)
     mes = torch.nn.MSELoss()
@@ -124,7 +146,7 @@ def fine_tune(epoch):
         optimizer.zero_grad()
         xrs, zs, hs = model(xs)
         commonz, S = model.TMCNF(xs)
-        # AsCL remains on the original hs; MNC remains on commonz.
+        # AsCL remains on original hs; MNC loss space is independently selectable.
         rec_terms = [mes(x, xr) for x, xr in zip(xs, xrs)]
         align_terms = [criterion.Structure_guided_Contrastive_Loss(h, commonz, S) for h in hs]
         rec_old, ascl = sum(rec_terms), sum(align_terms)
@@ -144,8 +166,13 @@ def fine_tune(epoch):
             if batch_idx == 0:
                 diagnostics = branch_diagnostics(model, xs, commonz, specs, joint)
         if weight > 0:
-            W = neighbor_weights(commonz, args.mnc_topk, args.mnc_hops, args.mnc_min_sim)
-            loss_mnc = neighbor_contrastive_loss(commonz, W, args.temperature_f)
+            W, batch_graph_stats = neighbor_weights(
+                commonz, args.mnc_topk, args.mnc_hops, args.mnc_min_sim,
+                endpoint_min_sim=args.mnc_endpoint_min_sim, return_stats=True)
+            for key, value in batch_graph_stats.items():
+                graph_stats[key] = graph_stats.get(key, 0.) + value
+            mnc_features = fusion_features(commonz, hs, args.mnc_feature_mode, args.fusion_alpha)
+            loss_mnc = neighbor_contrastive_loss(mnc_features, W, args.temperature_f)
             loss = loss + weight * loss_mnc
             total_mnc += loss_mnc.item()
             total_neighbors += (W > 0).float().sum(1).mean().item()
@@ -156,6 +183,7 @@ def fine_tune(epoch):
                  mnc_weight=weight, neighbors=total_neighbors/len(data_loader))
     stats.update({k: v / len(data_loader) for k, v in components.items()})
     stats.update(diagnostics)
+    stats.update({key: value / len(data_loader) for key, value in graph_stats.items()})
     stats.update(dec_weight=dec_weight, dec_weighted=dec_weight * stats['dec_raw'],
                  joint_weighted=args.lambda_joint * stats['rec_joint'])
     print(stats)
@@ -180,6 +208,5 @@ while epoch <= args.rec_epochs + args.fine_tune_epochs:
         (run_dir / 'metrics.json').write_text(json.dumps(metrics, indent=2))
         print('Saving model...')
     epoch += 1
-
 
 
