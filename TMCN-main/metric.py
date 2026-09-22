@@ -40,9 +40,15 @@ def evaluate(label, pred):
     pur = purity(label, pred)
     return nmi, ari, acc, pur
 
-def inference(loader, model, device, view, data_size, feature_mode='common', fusion_alpha=None):
-    if feature_mode not in ('common', 'concat', 'weighted_concat', 'complement'):
-        raise ValueError('feature_mode must be common, concat, weighted_concat, or complement')
+def inference(loader, model, device, view, data_size, feature_mode='common', fusion_alpha=None,
+              view_index=None):
+    if feature_mode not in ('common', 'concat', 'weighted_concat', 'complement', 'view'):
+        raise ValueError('feature_mode must be common, concat, weighted_concat, complement, or view')
+    if feature_mode == 'view':
+        if not isinstance(view_index, int) or not 0 <= view_index < view:
+            raise ValueError('view mode requires a valid zero-based view_index')
+    elif view_index is not None:
+        raise ValueError('view_index applies only to view mode')
     if fusion_alpha is not None:
         validate_alpha(fusion_alpha)
         if feature_mode != 'weighted_concat':
@@ -56,7 +62,11 @@ def inference(loader, model, device, view, data_size, feature_mode='common', fus
         for v in range(view):
             xs[v] = xs[v].to(device)
         with torch.no_grad():
-            commonz, _ = model.TMCNF(xs)
+            if feature_mode == 'view':
+                _, _, hs = model(xs)
+                commonz = hs[view_index]
+            else:
+                commonz, _ = model.TMCNF(xs)
             if feature_mode in ('concat', 'weighted_concat'):
                 # Use exactly the projected hs from TMCN, in view order.
                 # These are not guaranteed to be disentangled specific factors.
@@ -74,15 +84,17 @@ def inference(loader, model, device, view, data_size, feature_mode='common', fus
     return labels_vector, commonZ
 
 def valid(model, device, dataset, view, data_size, class_num, seed=10,
-          feature_mode='common', fusion_alpha=None):
+          feature_mode='common', fusion_alpha=None, view_index=None):
     test_loader = DataLoader(
             dataset,
             batch_size=256,
             shuffle=False,
         )
-    labels_vector, commonZ = inference(test_loader, model, device, view, data_size, feature_mode, fusion_alpha)
+    labels_vector, commonZ = inference(test_loader, model, device, view, data_size,
+                                      feature_mode, fusion_alpha, view_index)
     print('---------train over---------')
-    print('Clustering results: mode={}, dimensions={}'.format(feature_mode, commonZ.shape[1]))
+    label = 'view_{}'.format(view_index + 1) if feature_mode == 'view' else feature_mode
+    print('Clustering results: mode={}, dimensions={}'.format(label, commonZ.shape[1]))
     if feature_mode == 'weighted_concat':
         print('Shared distance weight alpha={}'.format(1.0 / (view + 1) if fusion_alpha is None else fusion_alpha))
     kmeans = KMeans(n_clusters=class_num, n_init=100, random_state=seed)
