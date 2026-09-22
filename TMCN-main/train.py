@@ -9,6 +9,7 @@ import random
 from loss import Loss
 from mnc import neighbor_weights, neighbor_contrastive_loss, mnc_weight
 from features import fusion_features, validate_alpha
+from view_neighbors import view_neighbor_loss
 import json
 from pathlib import Path
 from dataloader import load_data
@@ -38,6 +39,16 @@ parser.add_argument('--mnc_feature_mode', choices=['common', 'concat', 'weighted
                     help='MNC loss space; the detached graph is always built on commonz')
 parser.add_argument('--fusion_alpha', type=float, default=None,
                     help='Shared distance weight for weighted_concat MNC; default equal block weights')
+parser.add_argument('--lambda_view', type=float, default=0.0,
+                    help='Maximum weight of mean per-view neighbor loss; zero disables it')
+parser.add_argument('--view_neighbor_mode', choices=['shared', 'consensus'], default='shared',
+                    help='One-hop common graph, or its intersection with each view graph')
+parser.add_argument('--view_topk', type=int, default=10)
+parser.add_argument('--view_min_sim', type=float, default=0.5)
+parser.add_argument('--view_temperature', type=float, default=0.5)
+parser.add_argument('--view_start', type=int, default=10,
+                    help='Fine-tuning epochs before enabling the view loss')
+parser.add_argument('--view_ramp', type=int, default=20)
 parser.add_argument('--complementary', action='store_true',
                     help='Enable independent complementary heads and joint decoders')
 parser.add_argument('--lambda_joint', type=float, default=1.0)
@@ -62,8 +73,8 @@ if args.mnc_endpoint_min_sim is not None:
         parser.error('--mnc_endpoint_min_sim requires --mnc_hops 2 or 3')
 if args.lambda_mnc == 0 and (args.mnc_endpoint_min_sim is not None or args.mnc_feature_mode != 'common'):
     parser.error('MNC experiments require --lambda_mnc > 0')
-for name in ('lambda_joint', 'lambda_dec', 'old_rec_weight', 'lambda_mnc',
-             'temperature_f', 'learning_rate', 'weight_decay'):
+for name in ('lambda_joint', 'lambda_dec', 'old_rec_weight', 'lambda_mnc', 'lambda_view',
+             'temperature_f', 'view_temperature', 'learning_rate', 'weight_decay'):
     value = getattr(args, name)
     if not math.isfinite(value) or value < 0:
         parser.error(name + ' must be finite and nonnegative')
@@ -79,6 +90,10 @@ if args.lambda_mnc < 0 or args.mnc_topk < 1 or args.mnc_start < 0 or args.mnc_ra
     parser.error('Invalid MNC weight, topk, or schedule')
 if not -1 <= args.mnc_min_sim <= 1 or args.temperature_f <= 0:
     parser.error('Invalid similarity threshold or temperature')
+if args.view_topk < 1 or args.view_start < 0 or args.view_ramp < 0:
+    parser.error('view_topk >= 1 and nonnegative view schedule required')
+if not -1 <= args.view_min_sim <= 1 or args.view_temperature <= 0:
+    parser.error('Invalid view similarity threshold or temperature')
 if args.batch_size < 2 or args.low_feature_dim % 8:
     parser.error('batch_size >= 2 and low_feature_dim divisible by 8 required')
 if args.rec_epochs < 0 or args.fine_tune_epochs < 1:
@@ -133,12 +148,15 @@ def fine_tune(epoch):
     model.train()
     tot_loss = 0.
     total_mnc = 0.
+    total_view = 0.
     total_neighbors = 0.
     components = dict(rec_old=0., ascl=0., rec_joint=0., dec_raw=0.)
     diagnostics = {}
     graph_stats = {}
+    view_stats = {}
     dec_weight = mnc_weight(epoch - args.rec_epochs, args.lambda_dec, args.dec_start, args.dec_ramp)
     weight = mnc_weight(epoch - args.rec_epochs, args.lambda_mnc, args.mnc_start, args.mnc_ramp)
+    view_weight = mnc_weight(epoch - args.rec_epochs, args.lambda_view, args.view_start, args.view_ramp)
     mes = torch.nn.MSELoss()
     for batch_idx, (xs, _, _) in enumerate(data_loader):
         for v in range(view):
@@ -176,6 +194,15 @@ def fine_tune(epoch):
             loss = loss + weight * loss_mnc
             total_mnc += loss_mnc.item()
             total_neighbors += (W > 0).float().sum(1).mean().item()
+        # Keep disabled/warm-up runs on the original loss path, with no new graphs.
+        if view_weight > 0:
+            loss_view, batch_view_stats = view_neighbor_loss(
+                commonz, hs, args.view_neighbor_mode, args.view_topk,
+                args.view_min_sim, args.view_temperature)
+            loss = loss + view_weight * loss_view
+            total_view += loss_view.item()
+            for key, value in batch_view_stats.items():
+                view_stats[key] = view_stats.get(key, 0.) + value
         loss.backward()
         optimizer.step()
         tot_loss += loss.item()
@@ -184,6 +211,9 @@ def fine_tune(epoch):
     stats.update({k: v / len(data_loader) for k, v in components.items()})
     stats.update(diagnostics)
     stats.update({key: value / len(data_loader) for key, value in graph_stats.items()})
+    stats.update({key: value / len(data_loader) for key, value in view_stats.items()})
+    stats.update(view_loss=total_view / len(data_loader), view_weight=view_weight,
+                 view_weighted=view_weight * total_view / len(data_loader))
     stats.update(dec_weight=dec_weight, dec_weighted=dec_weight * stats['dec_raw'],
                  joint_weighted=args.lambda_joint * stats['rec_joint'])
     print(stats)
@@ -208,5 +238,4 @@ while epoch <= args.rec_epochs + args.fine_tune_epochs:
         (run_dir / 'metrics.json').write_text(json.dumps(metrics, indent=2))
         print('Saving model...')
     epoch += 1
-
 

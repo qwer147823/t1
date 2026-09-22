@@ -11,8 +11,8 @@ from features import validate_alpha
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--run_dir', required=True)
-    parser.add_argument('--feature_mode', choices=['common', 'concat', 'weighted_concat', 'complement', 'both', 'all'], default='common',
-                        help='all evaluates legacy common/concat/complement modes; weighted_concat is separate')
+    parser.add_argument('--feature_mode', choices=['common', 'concat', 'weighted_concat', 'complement', 'both', 'all', 'views'], default='common',
+                        help='views evaluates each original h separately; all keeps its legacy modes')
     parser.add_argument('--fusion_alpha', type=float, nargs='+', default=None,
                         help='One or more shared distance weights, only for weighted_concat')
     args = parser.parse_args()
@@ -37,7 +37,9 @@ if __name__ == '__main__':
     if 'complement' in modes and not model.complementary:
         parser.error('This checkpoint has no complementary branch; use common/concat/both/all')
     results = {}
-    evaluations = [(mode, None) for mode in modes]
+    evaluations = [(mode, None, None) for mode in modes]
+    if args.feature_mode == 'views':
+        evaluations = [('view', None, v) for v in range(views)]
     if args.feature_mode == 'weighted_concat':
         # Follow the trained weighted geometry unless explicitly overridden.
         saved_alpha = config.get('fusion_alpha') if config.get('mnc_feature_mode') == 'weighted_concat' else None
@@ -48,19 +50,28 @@ if __name__ == '__main__':
                 validate_alpha(alpha)
         except ValueError as exc:
             parser.error(str(exc))
-        evaluations = [('weighted_concat', alpha) for alpha in alphas]
+        evaluations = [('weighted_concat', alpha, None) for alpha in alphas]
     sweep = []
-    for mode, alpha in evaluations:
+    view_reports = []
+    for mode, alpha, view_index in evaluations:
         metrics = valid(model, device, dataset, views, size, classes,
-                        seed=config['seed'], feature_mode=mode, fusion_alpha=alpha)
+                        seed=config['seed'], feature_mode=mode, fusion_alpha=alpha,
+                        view_index=view_index)
         key = mode if alpha is None else mode + '_alpha_' + str(alpha).replace('.', 'p')
+        if mode == 'view':
+            key = 'view_' + str(view_index + 1)
         results[key] = metrics
         report = dict(feature_mode=mode, seed=config['seed'], n_init=100,
-                      feature_dim=config['high_feature_dim'] * (views + 1 if mode != 'common' else 1),
+                      feature_dim=config['high_feature_dim'] * (1 if mode in ('common', 'view') else views + 1),
                       fusion_alpha=alpha,
                       mnc_feature_mode=config.get('mnc_feature_mode', 'common'),
                       training_fusion_alpha=config.get('fusion_alpha'),
+                      lambda_view=config.get('lambda_view', 0.0),
+                      view_neighbor_mode=config.get('view_neighbor_mode', 'shared'),
                       metrics=metrics)
+        if mode == 'view':
+            report['view_number'] = view_index + 1  # h1 is hs[0]; reports are one-based.
+            view_reports.append(report)
         output = folder / ('eval_' + key + '.json')
         output.write_text(json.dumps(report, indent=2))
         print('Saved evaluation:', output)
@@ -68,6 +79,8 @@ if __name__ == '__main__':
             sweep.append(report)
     if sweep:
         (folder / 'eval_weighted_concat_sweep.json').write_text(json.dumps(sweep, indent=2))
+    if view_reports:
+        (folder / 'eval_views.json').write_text(json.dumps(view_reports, indent=2))
     if 'common' in results and 'concat' in results:
         print('concat - common:', {k: results['concat'][k] - results['common'][k]
                                   for k in results['common']})
